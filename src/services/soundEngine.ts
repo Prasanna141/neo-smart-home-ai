@@ -55,10 +55,10 @@ class NeoSoundEngine {
   }
 
   /**
-   * Starts real-time 16kHz 16-bit mono PCM microphone streaming for Gemini Live API
+   * Starts real-time 16kHz 16-bit mono PCM microphone streaming for Gemini Live API & Serverless VAD
    */
   public async startLiveMicStream(
-    onPcm16kChunk: (base64Pcm: string) => void
+    onPcm16kChunk: (base64Pcm: string, chunkRms: number) => void
   ): Promise<void> {
     this.stopLiveMicStream();
     const ctx = this.ensureContext();
@@ -88,7 +88,16 @@ class NeoSoundEngine {
     const targetSampleRate = 16000;
 
     processor.onaudioprocess = (e) => {
+      if (this.ctx && this.ctx.state === 'suspended') {
+        this.ctx.resume().catch(() => {});
+      }
       const inputData = e.inputBuffer.getChannelData(0);
+      let sumSq = 0;
+      for (let i = 0; i < inputData.length; i++) {
+        sumSq += inputData[i] * inputData[i];
+      }
+      const chunkRms = Math.sqrt(sumSq / Math.max(1, inputData.length));
+
       let pcm16: Int16Array;
 
       if (inputSampleRate === targetSampleRate) {
@@ -117,7 +126,7 @@ class NeoSoundEngine {
           Array.from(bytes.subarray(i, i + chunkSize))
         );
       }
-      onPcm16kChunk(window.btoa(binary));
+      onPcm16kChunk(window.btoa(binary), chunkRms);
     };
 
     const silentGain = ctx.createGain();
@@ -125,6 +134,114 @@ class NeoSoundEngine {
     this.micSource.connect(processor);
     processor.connect(silentGain);
     silentGain.connect(ctx.destination);
+  }
+
+  /**
+   * Packages an array of base64 16kHz 16-bit mono PCM chunks into a base64 WAV file
+   */
+  public buildWavBase64FromPcm16kChunks(base64Chunks: string[]): string {
+    const byteArrays: Uint8Array[] = [];
+    let totalDataBytes = 0;
+    for (const b64 of base64Chunks) {
+      const bin = window.atob(b64);
+      const arr = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) {
+        arr[i] = bin.charCodeAt(i);
+      }
+      byteArrays.push(arr);
+      totalDataBytes += arr.length;
+    }
+
+    const wavBuffer = new ArrayBuffer(44 + totalDataBytes);
+    const view = new DataView(wavBuffer);
+    const writeStr = (offset: number, str: string) => {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    };
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + totalDataBytes, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true); // PCM chunk size
+    view.setUint16(20, 1, true); // PCM format
+    view.setUint16(22, 1, true); // Mono
+    view.setUint32(24, 16000, true); // 16kHz
+    view.setUint32(28, 16000 * 2, true); // Byte rate
+    view.setUint16(32, 2, true); // Block align
+    view.setUint16(34, 16, true); // 16-bit
+    writeStr(36, 'data');
+    view.setUint32(40, totalDataBytes, true);
+
+    const outBytes = new Uint8Array(wavBuffer);
+    let offset = 44;
+    for (const arr of byteArrays) {
+      outBytes.set(arr, offset);
+      offset += arr.length;
+    }
+
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < outBytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(
+        null,
+        Array.from(outBytes.subarray(i, i + chunkSize))
+      );
+    }
+    return window.btoa(binary);
+  }
+
+  /**
+   * Speaks Sinhala/English text via server TTS stream or Web Speech synthesis while animating the Harmonic Orb
+   */
+  public async speakFallbackText(text: string): Promise<void> {
+    const clean = (text || '').replace(/[*#`_~]/g, '').trim();
+    if (!clean) return;
+
+    this.ensureContext();
+    this.setDucking(true);
+    this.simulatedSpeechEnergy = 0.75;
+    if (this.onLiveSpeakingStateChange) {
+      this.onLiveSpeakingStateChange(true);
+    }
+
+    const finishSpeaking = () => {
+      this.simulatedSpeechEnergy = 0;
+      this.setDucking(false);
+      if (this.onLiveSpeakingStateChange) {
+        this.onLiveSpeakingStateChange(false);
+      }
+    };
+
+    try {
+      const audio = new Audio(
+        `/api/neo/tts-proxy?text=${encodeURIComponent(clean.slice(0, 500))}`
+      );
+      this.activeAudioElement = audio;
+      await new Promise<void>((resolve, reject) => {
+        audio.onended = () => resolve();
+        audio.onerror = (e) => reject(e);
+        audio.play().catch(reject);
+      });
+      finishSpeaking();
+      return;
+    } catch {
+      if ('speechSynthesis' in window) {
+        try {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(clean);
+          utter.lang = 'si-LK';
+          utter.rate = 1.0;
+          await new Promise<void>((resolve) => {
+            utter.onend = () => resolve();
+            utter.onerror = () => resolve();
+            window.speechSynthesis.speak(utter);
+          });
+        } catch {}
+      }
+      finishSpeaking();
+    }
   }
 
   public stopLiveMicStream() {

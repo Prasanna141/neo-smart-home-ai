@@ -5,7 +5,6 @@ import path from 'path';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createServer as createViteServer } from 'vite';
 import QRCode from 'qrcode';
 import {
   GoogleGenAI,
@@ -394,11 +393,21 @@ app.get('/api/neo/memory', (_req, res) => {
 // ============================================================================
 
 function getGenAIClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.API_KEY ||
+    process.env.VITE_GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY environment variable is not configured.');
   }
-  return new GoogleGenAI({ apiKey });
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
 }
 
 function decodeHtmlEntities(text: string): string {
@@ -660,9 +669,11 @@ async function refreshBackgroundInternetCache() {
   } catch {}
 }
 
-// Start background cache immediately and refresh every 2 minutes
+// Start background cache immediately and refresh every 2 minutes on stateful servers
 refreshBackgroundInternetCache();
-setInterval(refreshBackgroundInternetCache, 120 * 1000);
+if (!process.env.VERCEL) {
+  setInterval(refreshBackgroundInternetCache, 120 * 1000);
+}
 
 // Detect if a user's spoken sentence is asking for internet info / news / weather / prices / facts
 function looksLikeInternetQuestion(text: string): boolean {
@@ -2208,6 +2219,274 @@ app.post('/api/neo/serverless-tool-exec', async (req, res) => {
   }
 });
 
+// Sinhala/English TTS Audio Proxy for Serverless Voice Fallback
+app.get('/api/neo/tts-proxy', async (req, res) => {
+  try {
+    const text = String(req.query.text || '').trim().slice(0, 200);
+    if (!text) return res.status(400).send('Missing text');
+    const ttsUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
+      text
+    )}&tl=si&client=tw-ob`;
+    const upstream = await fetch(ttsUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+    });
+    res.status(upstream.status);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const arrayBuf = await upstream.arrayBuffer();
+    res.send(Buffer.from(arrayBuf));
+  } catch {
+    res.status(500).send('TTS proxy failed');
+  }
+});
+
+// Complete Server-Side Voice Turn Endpoint for Vercel Serverless Continuous Mic Mode
+app.post('/api/neo/voice-turn', async (req, res) => {
+  try {
+    const {
+      transcript = '',
+      audioWavBase64 = '',
+      devices = [],
+      schedule = [],
+      currentNews = [],
+      language = 'si',
+    } = req.body || {};
+
+    const cleanTranscript = String(transcript || '').trim();
+    if (!cleanTranscript && !audioWavBase64) {
+      return res.json({ replyText: '', actions: [] });
+    }
+
+    if (Array.isArray(devices) && devices.length > 0) {
+      neoBrain.savedDevices = devices;
+      savePersistentBrain(neoBrain);
+    }
+
+    const clientActions: any[] = [];
+    let fetchedNewsItems: any[] = [];
+
+    // Instant smart home device inference if user spoke a clear command
+    if (cleanTranscript) {
+      const directAct = inferDirectSmartHomeAction(cleanTranscript, devices);
+      if (directAct) {
+        clientActions.push(directAct);
+      }
+    }
+
+    // Proactive live internet search if question looks like news/weather/rates/facts
+    let liveWebContext = '';
+    if (cleanTranscript && looksLikeInternetQuestion(cleanTranscript)) {
+      try {
+        const webRes = await performDirectInternetSearch(cleanTranscript);
+        liveWebContext = `\n\n[LIVE INTERNET SEARCH RESULTS FOR "${cleanTranscript}"]:\n${webRes.summaryText}`;
+        if (webRes.articles?.length) {
+          fetchedNewsItems = webRes.articles;
+        }
+      } catch {}
+    } else if (!cachedLiveInternetContext) {
+      await refreshBackgroundInternetCache();
+    }
+
+    const systemInstruction =
+      buildGeminiLiveSystemInstruction({
+        language,
+        devices: devices.length ? devices : neoBrain.savedDevices,
+        schedule: neoBrain.schedule.length ? neoBrain.schedule : schedule,
+        currentNews,
+      }) + liveWebContext;
+
+    const ai = getGenAIClient();
+    const parts: any[] = [];
+    if (audioWavBase64) {
+      parts.push({
+        inlineData: {
+          mimeType: 'audio/wav',
+          data: audioWavBase64,
+        },
+      });
+    }
+    if (cleanTranscript) {
+      parts.push({
+        text: cleanTranscript,
+      });
+    } else {
+      parts.push({
+        text: 'Listen to the user speaking in Sinhala or English in this audio clip and respond naturally in spoken Sinhala (2-3 short sentences). Execute any smart home, music, schedule, memory, or internet search tool if requested.',
+      });
+    }
+
+    const tools = [
+      {
+        functionDeclarations: [
+          controlTuyaDeviceDecl,
+          activateTuyaSceneDecl,
+          controlMusicPlayerDecl,
+          manageDailyScheduleDecl,
+          saveToLongTermMemoryDecl,
+          recallLongTermMemoryDecl,
+          getLiveNewsDecl,
+          searchInternetDecl,
+        ],
+      },
+    ];
+
+    let response: any = null;
+    for (const modelName of ['gemini-3.8-flash', 'gemini-flash-latest']) {
+      try {
+        response = await ai.models.generateContent({
+          model: modelName,
+          contents: [{ role: 'user', parts }],
+          config: {
+            systemInstruction,
+            tools,
+          },
+        });
+        if (response) break;
+      } catch (modelErr) {
+        console.warn(`Voice turn model ${modelName} fallback:`, modelErr);
+      }
+    }
+
+    let replyText = '';
+    const fnCalls = response?.functionCalls || [];
+
+    if (fnCalls.length > 0) {
+      let extraSearchSummary = '';
+      for (const fc of fnCalls) {
+        if (fc.name === 'saveToLongTermMemory') {
+          const fact = String((fc.args as any)?.fact || '').trim();
+          const category = String((fc.args as any)?.category || 'personal');
+          if (fact) addMemoryFact(fact, category);
+        } else if (fc.name === 'manageDailySchedule') {
+          const action = String((fc.args as any)?.action || 'add').toLowerCase();
+          const title = String((fc.args as any)?.title || 'Reminder').trim();
+          const targetTime = String((fc.args as any)?.time || '17:00');
+          if (action === 'add') {
+            neoBrain.schedule.push({
+              id: `sch-${Date.now()}`,
+              title,
+              sinhalaTitle: title,
+              time: targetTime,
+              category: 'reminder',
+              priority: 'high',
+              completed: false,
+              reminded: false,
+            });
+            savePersistentBrain(neoBrain);
+          }
+          clientActions.push({
+            name: 'manageDailySchedule',
+            args: { action, title, time: targetTime, schedule: neoBrain.schedule },
+          });
+        } else if (fc.name === 'controlMusicPlayer') {
+          const action = String((fc.args as any)?.action || 'play').toLowerCase();
+          const genreOrQuery = String((fc.args as any)?.genreOrQuery || '').trim();
+          if (action === 'pause' || action === 'stop') {
+            clientActions.push({ name: 'controlMusicPlayer', args: { action: 'stop' } });
+          } else {
+            const webTrack = await searchWebMusicStream(genreOrQuery);
+            clientActions.push({
+              name: 'controlMusicPlayer',
+              args: { action: 'play', genreOrQuery, webTrack },
+            });
+            if (!replyText) {
+              replyText = `හරි, දැන් මම "${webTrack.title}" ගීතය වාදනය කරනවා.`;
+            }
+          }
+        } else if (fc.name === 'getLiveNews' || fc.name === 'searchInternet') {
+          const q =
+            (fc.args as any)?.query ||
+            (fc.args as any)?.topic ||
+            cleanTranscript ||
+            'Sri Lanka latest news today';
+          const webResult = await performDirectInternetSearch(q);
+          if (webResult.articles?.length) fetchedNewsItems = webResult.articles;
+          extraSearchSummary = webResult.summaryText;
+        } else {
+          clientActions.push({ name: fc.name, args: fc.args });
+        }
+      }
+
+      if (extraSearchSummary) {
+        for (const modelName of ['gemini-3.8-flash', 'gemini-flash-latest']) {
+          try {
+            const followUp = await ai.models.generateContent({
+              model: modelName,
+              contents: `User asked: "${cleanTranscript || 'Live news/info'}".\nHere is the live internet data:\n${extraSearchSummary}\n\nRespond naturally in spoken Sinhala in 2-4 concise sentences.`,
+              config: { systemInstruction },
+            });
+            if (followUp?.text) {
+              replyText = followUp.text;
+              break;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    if (!replyText && response?.text) {
+      replyText = response.text;
+    }
+
+    if (!replyText && clientActions.length > 0) {
+      const firstAct = clientActions[0];
+      if (firstAct.name === 'controlTuyaDevice') {
+        const isOff = String(firstAct.args?.power).toLowerCase() === 'off';
+        replyText = isOff
+          ? 'හරි, ස්විච් එක ඕෆ් කළා.'
+          : 'හරි, ස්විච් එක ඔන් කළා.';
+      } else {
+        replyText = 'හරි, එය සිදු කළා.';
+      }
+    }
+
+    if (cleanTranscript || replyText) {
+      recordEpisodicTurn(cleanTranscript || '[Voice Audio]', replyText);
+    }
+
+    // Try generating natural Charon 24kHz PCM voice audio via Gemini TTS
+    let audioPcm24kBase64 = '';
+    if (replyText) {
+      try {
+        const ttsRes = await ai.models.generateContent({
+          model: 'gemini-3.8-flash-lite-tts',
+          contents: [{ parts: [{ text: replyText }] }],
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: 'Charon' },
+              },
+            },
+          },
+        });
+        const inlineAudio =
+          ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (inlineAudio) {
+          audioPcm24kBase64 = inlineAudio;
+        }
+      } catch {}
+    }
+
+    res.json({
+      replyText,
+      audioPcm24kBase64,
+      actions: clientActions,
+      newsItems: fetchedNewsItems,
+      schedule: neoBrain.schedule,
+    });
+  } catch (err: any) {
+    res.status(200).json({
+      replyText: '',
+      actions: [],
+      error: err?.message || 'Voice turn error',
+    });
+  }
+});
+
 async function startServer() {
   const httpServer = http.createServer(app);
 
@@ -2813,6 +3092,7 @@ async function startServer() {
   });
 
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
