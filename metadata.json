@@ -1,0 +1,6 @@
+{
+  "name": "Neo — Smart Home & Personal AI Agent",
+  "description": "Voice-first bilingual (Sinhala & English) smart home AI agent with always-on 'Neo' wake-word detection, Tuya IoT device control, camera face recognition, daily planner, live news, and music playback.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
