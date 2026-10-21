@@ -2565,6 +2565,8 @@ async function startServer() {
       }
     }, 5000);
 
+    let lastInitConfig: any = {};
+
     const initializeGeminiLiveSession = (initConfig: {
       voiceName?: string;
       language?: string;
@@ -2574,6 +2576,7 @@ async function startServer() {
       recognizedMember?: any;
     }) => {
       if (liveSessionPromise) return;
+      lastInitConfig = { ...lastInitConfig, ...initConfig };
 
       sessionDevices = initConfig.devices || [];
       if (sessionDevices.length > 0) {
@@ -2932,13 +2935,17 @@ async function startServer() {
         },
         onerror: (err: any) => {
           console.error('Gemini Live session error:', err);
-          safeSend({
-            type: 'error',
-            message: err?.message || 'Gemini Live connection error',
-          });
+          liveSessionPromise = null;
         },
         onclose: () => {
-          safeSend({ type: 'closed' });
+          liveSessionPromise = null;
+          if (clientWs.readyState === WebSocket.OPEN) {
+            setTimeout(() => {
+              if (clientWs.readyState === WebSocket.OPEN && !liveSessionPromise) {
+                initializeGeminiLiveSession(lastInitConfig);
+              }
+            }, 400);
+          }
         },
       };
 
@@ -2976,6 +2983,7 @@ async function startServer() {
         })
         .catch((err: any) => {
           console.error('Failed to connect to gemini-3.8-live:', err);
+          liveSessionPromise = null;
           safeSend({
             type: 'error',
             message: err?.message || 'Could not connect to Gemini Live',

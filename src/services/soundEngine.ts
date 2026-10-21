@@ -6,7 +6,12 @@ class NeoSoundEngine {
   private micAnalyser: AnalyserNode | null = null;
   private micSource: MediaStreamAudioSourceNode | null = null;
   private micProcessor: ScriptProcessorNode | null = null;
+  private micSilentGain: GainNode | null = null;
   private micStream: MediaStream | null = null;
+  private micKeepAliveTimer: number | null = null;
+  private shouldKeepMicOpen = false;
+  private currentMicRms = 0;
+  private lastChunkCallback: ((base64Pcm: string, chunkRms: number) => void) | null = null;
   private musicGain: GainNode | null = null;
   private voiceGain: GainNode | null = null;
   private isPlayingMusic = false;
@@ -60,19 +65,39 @@ class NeoSoundEngine {
   public async startLiveMicStream(
     onPcm16kChunk: (base64Pcm: string, chunkRms: number) => void
   ): Promise<void> {
-    this.stopLiveMicStream();
+    this.cleanupMicNodesOnly();
+    this.shouldKeepMicOpen = true;
+    this.lastChunkCallback = onPcm16kChunk;
     const ctx = this.ensureContext();
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        sampleRate: 16000,
-        channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
       },
     });
+
+    if (!this.shouldKeepMicOpen) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+
     this.micStream = stream;
+
+    // Auto-recover if OS or browser SpeechRecognition ever ends the audio track while mic is ON
+    stream.getAudioTracks().forEach((track) => {
+      track.enabled = true;
+      track.onended = () => {
+        if (this.shouldKeepMicOpen && this.lastChunkCallback) {
+          setTimeout(() => {
+            if (this.shouldKeepMicOpen && this.lastChunkCallback) {
+              this.startLiveMicStream(this.lastChunkCallback).catch(() => {});
+            }
+          }, 250);
+        }
+      };
+    });
 
     this.micAnalyser = ctx.createAnalyser();
     this.micAnalyser.fftSize = 256;
@@ -88,6 +113,7 @@ class NeoSoundEngine {
     const targetSampleRate = 16000;
 
     processor.onaudioprocess = (e) => {
+      if (!this.shouldKeepMicOpen) return;
       if (this.ctx && this.ctx.state === 'suspended') {
         this.ctx.resume().catch(() => {});
       }
@@ -97,6 +123,7 @@ class NeoSoundEngine {
         sumSq += inputData[i] * inputData[i];
       }
       const chunkRms = Math.sqrt(sumSq / Math.max(1, inputData.length));
+      this.currentMicRms = chunkRms;
 
       let pcm16: Int16Array;
 
@@ -129,11 +156,33 @@ class NeoSoundEngine {
       onPcm16kChunk(window.btoa(binary), chunkRms);
     };
 
+    // Keep reference on `this` with micro-gain so V8 GC & Blink audio thread never suspend the node!
     const silentGain = ctx.createGain();
-    silentGain.gain.value = 0;
+    silentGain.gain.value = 0.00001;
+    this.micSilentGain = silentGain;
+
     this.micSource.connect(processor);
     processor.connect(silentGain);
     silentGain.connect(ctx.destination);
+
+    if (this.micKeepAliveTimer !== null) {
+      clearInterval(this.micKeepAliveTimer);
+    }
+    this.micKeepAliveTimer = window.setInterval(() => {
+      if (!this.shouldKeepMicOpen) return;
+      if (this.ctx && this.ctx.state === 'suspended') {
+        this.ctx.resume().catch(() => {});
+      }
+      const tracks = this.micStream?.getAudioTracks() || [];
+      const hasLiveTrack = tracks.some((t) => t.readyState === 'live');
+      if (!hasLiveTrack && this.lastChunkCallback) {
+        this.startLiveMicStream(this.lastChunkCallback).catch(() => {});
+      } else {
+        tracks.forEach((t) => {
+          if (!t.enabled) t.enabled = true;
+        });
+      }
+    }, 1500);
   }
 
   /**
@@ -244,13 +293,23 @@ class NeoSoundEngine {
     }
   }
 
-  public stopLiveMicStream() {
+  private cleanupMicNodesOnly() {
+    if (this.micKeepAliveTimer !== null) {
+      clearInterval(this.micKeepAliveTimer);
+      this.micKeepAliveTimer = null;
+    }
     if (this.micProcessor) {
       try {
         this.micProcessor.onaudioprocess = null;
         this.micProcessor.disconnect();
       } catch {}
       this.micProcessor = null;
+    }
+    if (this.micSilentGain) {
+      try {
+        this.micSilentGain.disconnect();
+      } catch {}
+      this.micSilentGain = null;
     }
     if (this.micSource) {
       try {
@@ -259,10 +318,20 @@ class NeoSoundEngine {
       this.micSource = null;
     }
     if (this.micStream) {
-      this.micStream.getTracks().forEach((t) => t.stop());
+      this.micStream.getTracks().forEach((t) => {
+        t.onended = null;
+        t.stop();
+      });
       this.micStream = null;
     }
     this.micAnalyser = null;
+    this.currentMicRms = 0;
+  }
+
+  public stopLiveMicStream() {
+    this.shouldKeepMicOpen = false;
+    this.lastChunkCallback = null;
+    this.cleanupMicNodesOnly();
   }
 
   /**
@@ -345,7 +414,7 @@ class NeoSoundEngine {
   }
 
   public getMicRmsLevel(): number {
-    if (!this.micAnalyser) return 0;
+    if (!this.micAnalyser) return this.currentMicRms;
     const buf = new Uint8Array(this.micAnalyser.fftSize);
     this.micAnalyser.getByteTimeDomainData(buf);
     let sumSq = 0;
@@ -353,7 +422,7 @@ class NeoSoundEngine {
       const norm = (buf[i] - 128) / 128;
       sumSq += norm * norm;
     }
-    return Math.sqrt(sumSq / buf.length);
+    return Math.max(this.currentMicRms, Math.sqrt(sumSq / buf.length));
   }
 
   public playWakeChime() {

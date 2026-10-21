@@ -691,12 +691,16 @@ export function App() {
     [applyNeoToolActions]
   );
 
+  const lastSessionStartTimeRef = useRef<number>(0);
+
   // Connect to Real-Time Gemini Live over WebSocket (or stay continuously active in Vercel Serverless Voice Mode)
   const startDirectGeminiLiveSession = useCallback(async () => {
+    // Never turn off inside startDirectGeminiLiveSession!
     if (isLiveConnectedRef.current) {
-      stopDirectGeminiLiveSession();
       return;
     }
+
+    lastSessionStartTimeRef.current = Date.now();
 
     if (wakeRecognitionRef.current) {
       try {
@@ -706,23 +710,209 @@ export function App() {
       wakeRecognitionRef.current = null;
     }
 
+    const isVercelHost =
+      typeof window !== 'undefined' &&
+      window.location.hostname.includes('vercel.app');
+
     soundEngine.playWakeChime();
     setIsLiveConnected(true);
     isLiveConnectedRef.current = true;
-    isServerlessModeRef.current = false;
+    isServerlessModeRef.current = isVercelHost;
     setAgentState('listening');
     userTurnBufferRef.current = '';
     vadChunksRef.current = [];
     vadSpeakingRef.current = false;
     pendingTranscriptRef.current = '';
 
-    // 1. Start Microphone Stream IMMEDIATELY so Mic & Harmonic Orb stay active even on Vercel
+    // 1. Start Browser SpeechRecognition SYNCHRONOUSLY inside user gesture before any await!
+    const SpeechRec =
+      (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition;
+    if (SpeechRec) {
+      try {
+        const sr = new SpeechRec();
+        sr.continuous = true;
+        sr.interimResults = true;
+        sr.lang = 'si-LK';
+        sr.onresult = (ev: any) => {
+          let latest = '';
+          let isFinal = false;
+          for (let i = ev.resultIndex; i < ev.results.length; i++) {
+            latest += ev.results[i][0].transcript + ' ';
+            if (ev.results[i].isFinal) isFinal = true;
+          }
+          const cleaned = latest.trim();
+          if (cleaned) {
+            pendingTranscriptRef.current = cleaned;
+            const now = Date.now();
+            if (now - lastLocalCmdTimeRef.current > 1800) {
+              const localAct = detectLocalDeviceCommand(cleaned);
+              if (localAct) {
+                lastLocalCmdTimeRef.current = now;
+                applyNeoToolActions([localAct]);
+              }
+            }
+            if (isFinal) {
+              const activeWs = liveWsRef.current;
+              if (
+                activeWs &&
+                activeWs.readyState === WebSocket.OPEN &&
+                !isServerlessModeRef.current
+              ) {
+                activeWs.send(
+                  JSON.stringify({
+                    type: 'voice_transcript',
+                    text: cleaned,
+                  })
+                );
+              } else {
+                const recordedChunks = vadChunksRef.current.slice();
+                vadChunksRef.current = [];
+                vadSpeakingRef.current = false;
+                vadSilenceStartRef.current = 0;
+                pendingTranscriptRef.current = '';
+                const wavB64 =
+                  recordedChunks.length >= 2
+                    ? soundEngine.buildWavBase64FromPcm16kChunks(recordedChunks)
+                    : '';
+                sendServerlessVoiceTurn(cleaned, wavB64);
+              }
+            }
+          }
+        };
+        sr.onerror = () => {
+          // Never turn off Mic on SpeechRecognition transient errors
+        };
+        sr.onend = () => {
+          if (isLiveConnectedRef.current) {
+            try {
+              sr.start();
+            } catch {
+              setTimeout(() => {
+                if (isLiveConnectedRef.current) {
+                  try {
+                    sr.start();
+                  } catch {}
+                }
+              }, 300);
+            }
+          }
+        };
+        liveSpeechHelperRef.current = sr;
+        sr.start();
+      } catch {}
+    }
+
+    // 2. Connect WebSocket when running on a stateful Node server (skip on *.vercel.app where WebSockets are unsupported)
+    if (!isVercelHost) {
+      let wsOpened = false;
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/api/neo/live`;
+        const ws = new WebSocket(wsUrl);
+        liveWsRef.current = ws;
+
+        ws.onopen = () => {
+          wsOpened = true;
+          isServerlessModeRef.current = false;
+          vadChunksRef.current = [];
+          vadSpeakingRef.current = false;
+          ws.send(
+            JSON.stringify({
+              type: 'init',
+              voiceName: 'Charon',
+              language: 'si',
+              devices: devicesRef.current,
+              schedule: scheduleRef.current,
+              currentNews: newsRef.current,
+            })
+          );
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+
+            if (msg.type === 'audio' && msg.audio) {
+              soundEngine.enqueueLivePcm24kChunk(msg.audio);
+            } else if (msg.type === 'interrupted') {
+              soundEngine.clearLiveAudioQueue();
+              setAgentState('listening');
+            } else if (
+              msg.type === 'live_ready' &&
+              Array.isArray(msg.schedule)
+            ) {
+              setSchedule(msg.schedule);
+            } else if (msg.type === 'reminder_due' && msg.reminder) {
+              soundEngine.playWakeChime();
+            } else if (msg.type === 'input_transcription' && msg.text) {
+              userTurnBufferRef.current += msg.text;
+              const now = Date.now();
+              if (now - lastLocalCmdTimeRef.current > 1800) {
+                const localAct = detectLocalDeviceCommand(
+                  userTurnBufferRef.current
+                );
+                if (localAct) {
+                  lastLocalCmdTimeRef.current = now;
+                  applyNeoToolActions([localAct]);
+                }
+              }
+            } else if (msg.type === 'tool_actions') {
+              if (Array.isArray(msg.newsItems) && msg.newsItems.length > 0) {
+                setNews(msg.newsItems);
+                newsRef.current = msg.newsItems;
+              }
+              if (Array.isArray(msg.actions) && msg.actions.length > 0) {
+                lastLocalCmdTimeRef.current = Date.now();
+                applyNeoToolActions(msg.actions);
+              }
+            } else if (msg.type === 'turn_complete') {
+              userTurnBufferRef.current = '';
+            } else if (msg.type === 'error' || msg.type === 'closed') {
+              // If server Gemini Live session closed/errored, switch seamlessly to Serverless Voice Mode without turning off Mic!
+              isServerlessModeRef.current = true;
+              try {
+                ws.onclose = null;
+                ws.onerror = null;
+                ws.close();
+              } catch {}
+              liveWsRef.current = null;
+            }
+          } catch {}
+        };
+
+        ws.onerror = () => {
+          if (isLiveConnectedRef.current) {
+            isServerlessModeRef.current = true;
+            liveWsRef.current = null;
+          }
+        };
+
+        ws.onclose = () => {
+          if (isLiveConnectedRef.current) {
+            isServerlessModeRef.current = true;
+            liveWsRef.current = null;
+            if (!wsOpened) {
+              setAgentState('listening');
+            }
+          }
+        };
+      } catch {
+        isServerlessModeRef.current = true;
+      }
+    }
+
+    // 3. Start Microphone Stream so Mic & Harmonic Orb stay active continuously
     try {
       await soundEngine.startLiveMicStream((base64Pcm16k, chunkRms) => {
         if (!isLiveConnectedRef.current) return;
 
         const ws = liveWsRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (
+          ws &&
+          ws.readyState === WebSocket.OPEN &&
+          !isServerlessModeRef.current
+        ) {
           ws.send(
             JSON.stringify({
               type: 'audio',
@@ -732,11 +922,8 @@ export function App() {
           return;
         }
 
-        // If WebSocket is not open (e.g., on Vercel Serverless), run continuous VAD voice capture immediately
-        if (
-          !isProcessingTurnRef.current &&
-          !soundEngine.isLiveSpeaking()
-        ) {
+        // Continuous VAD voice capture for Vercel Serverless / HTTP Voice Mode
+        if (!isProcessingTurnRef.current && !soundEngine.isLiveSpeaking()) {
           const isVoiceActive = chunkRms > 0.018;
           if (isVoiceActive) {
             if (!vadSpeakingRef.current) {
@@ -771,170 +958,23 @@ export function App() {
     } catch (micErr) {
       console.warn('Mic stream error:', micErr);
     }
-
-    // 2. Connect WebSocket when running on a stateful Node server; on Vercel, fall back cleanly without turning off Mic
-    let wsOpened = false;
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/api/neo/live`;
-      const ws = new WebSocket(wsUrl);
-      liveWsRef.current = ws;
-
-      ws.onopen = () => {
-        wsOpened = true;
-        isServerlessModeRef.current = false;
-        vadChunksRef.current = [];
-        vadSpeakingRef.current = false;
-        ws.send(
-          JSON.stringify({
-            type: 'init',
-            voiceName: 'Charon',
-            language: 'si',
-            devices: devicesRef.current,
-            schedule: scheduleRef.current,
-            currentNews: newsRef.current,
-          })
-        );
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-
-          if (msg.type === 'audio' && msg.audio) {
-            soundEngine.enqueueLivePcm24kChunk(msg.audio);
-          } else if (msg.type === 'interrupted') {
-            soundEngine.clearLiveAudioQueue();
-            setAgentState('listening');
-          } else if (msg.type === 'live_ready' && Array.isArray(msg.schedule)) {
-            setSchedule(msg.schedule);
-          } else if (msg.type === 'reminder_due' && msg.reminder) {
-            soundEngine.playWakeChime();
-          } else if (msg.type === 'input_transcription' && msg.text) {
-            userTurnBufferRef.current += msg.text;
-            const now = Date.now();
-            if (now - lastLocalCmdTimeRef.current > 1800) {
-              const localAct = detectLocalDeviceCommand(
-                userTurnBufferRef.current
-              );
-              if (localAct) {
-                lastLocalCmdTimeRef.current = now;
-                applyNeoToolActions([localAct]);
-              }
-            }
-          } else if (msg.type === 'tool_actions') {
-            if (Array.isArray(msg.newsItems) && msg.newsItems.length > 0) {
-              setNews(msg.newsItems);
-              newsRef.current = msg.newsItems;
-            }
-            if (Array.isArray(msg.actions) && msg.actions.length > 0) {
-              lastLocalCmdTimeRef.current = Date.now();
-              applyNeoToolActions(msg.actions);
-            }
-          } else if (msg.type === 'turn_complete') {
-            userTurnBufferRef.current = '';
-          }
-        } catch {}
-      };
-
-      ws.onerror = () => {
-        // Never turn off the Mic! Switch seamlessly to Vercel Serverless Continuous Voice Mode
-        if (isLiveConnectedRef.current) {
-          isServerlessModeRef.current = true;
-          liveWsRef.current = null;
-        }
-      };
-
-      ws.onclose = () => {
-        // Keep the Mic ON even if WebSocket closes or is unsupported on Vercel
-        if (isLiveConnectedRef.current) {
-          isServerlessModeRef.current = true;
-          liveWsRef.current = null;
-          if (!wsOpened) {
-            setAgentState('listening');
-          }
-        }
-      };
-    } catch {
-      isServerlessModeRef.current = true;
-    }
-
-    // 3. Parallel browser SpeechRecognition helper for instant Sinhala/Singlish Smart Switch & Live Internet Search
-    const SpeechRec =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
-    if (SpeechRec) {
-      try {
-        const sr = new SpeechRec();
-        sr.continuous = true;
-        sr.interimResults = true;
-        sr.lang = 'si-LK';
-        sr.onresult = (ev: any) => {
-          let latest = '';
-          let isFinal = false;
-          for (let i = ev.resultIndex; i < ev.results.length; i++) {
-            latest += ev.results[i][0].transcript + ' ';
-            if (ev.results[i].isFinal) isFinal = true;
-          }
-          const cleaned = latest.trim();
-          if (cleaned) {
-            pendingTranscriptRef.current = cleaned;
-            const now = Date.now();
-            if (now - lastLocalCmdTimeRef.current > 1800) {
-              const localAct = detectLocalDeviceCommand(cleaned);
-              if (localAct) {
-                lastLocalCmdTimeRef.current = now;
-                applyNeoToolActions([localAct]);
-              }
-            }
-            if (isFinal) {
-              const activeWs = liveWsRef.current;
-              if (activeWs && activeWs.readyState === WebSocket.OPEN) {
-                activeWs.send(
-                  JSON.stringify({
-                    type: 'voice_transcript',
-                    text: cleaned,
-                  })
-                );
-              } else {
-                const recordedChunks = vadChunksRef.current.slice();
-                vadChunksRef.current = [];
-                vadSpeakingRef.current = false;
-                vadSilenceStartRef.current = 0;
-                pendingTranscriptRef.current = '';
-                const wavB64 =
-                  recordedChunks.length >= 2
-                    ? soundEngine.buildWavBase64FromPcm16kChunks(recordedChunks)
-                    : '';
-                sendServerlessVoiceTurn(cleaned, wavB64);
-              }
-            }
-          }
-        };
-        sr.onerror = () => {
-          // Ignore transient speech recognition errors and keep mic active
-        };
-        sr.onend = () => {
-          if (isLiveConnectedRef.current) {
-            setTimeout(() => {
-              if (isLiveConnectedRef.current) {
-                try {
-                  sr.start();
-                } catch {}
-              }
-            }, 250);
-          }
-        };
-        liveSpeechHelperRef.current = sr;
-        sr.start();
-      } catch {}
-    }
   }, [
     applyNeoToolActions,
     detectLocalDeviceCommand,
     sendServerlessVoiceTurn,
-    stopDirectGeminiLiveSession,
   ]);
+
+  const handleToggleLive = useCallback(() => {
+    if (isLiveConnectedRef.current) {
+      // Prevent accidental double-tap / ghost click within 800ms of turning ON
+      if (Date.now() - lastSessionStartTimeRef.current < 800) {
+        return;
+      }
+      stopDirectGeminiLiveSession();
+    } else {
+      startDirectGeminiLiveSession();
+    }
+  }, [startDirectGeminiLiveSession, stopDirectGeminiLiveSession]);
 
   // Interrupt Neo speaking immediately (Barge-In)
   const handleInterruptSpeaking = useCallback(() => {
@@ -942,68 +982,12 @@ export function App() {
     setAgentState('listening');
   }, []);
 
-  // Standby Wake-Word Sentinel ("Neo" / "නියෝ") when Live session is not yet connected
-  useEffect(() => {
-    if (isLiveConnected) return;
-
-    const SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
-
-    let isMounted = true;
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
-
-    recognition.onresult = (event: any) => {
-      if (isLiveConnectedRef.current) return;
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript.toLowerCase().trim();
-        if (
-          transcript.includes('neo') ||
-          transcript.includes('niyo') ||
-          transcript.includes('නියෝ')
-        ) {
-          startDirectGeminiLiveSession();
-          break;
-        }
-      }
-    };
-
-    recognition.onend = () => {
-      if (isMounted && !isLiveConnectedRef.current) {
-        setTimeout(() => {
-          try {
-            if (isMounted && !isLiveConnectedRef.current) {
-              recognition.start();
-            }
-          } catch {}
-        }, 400);
-      }
-    };
-
-    wakeRecognitionRef.current = recognition;
-    try {
-      recognition.start();
-    } catch {}
-
-    return () => {
-      isMounted = false;
-      try {
-        recognition.onend = null;
-        recognition.stop();
-      } catch {}
-    };
-  }, [isLiveConnected, startDirectGeminiLiveSession]);
-
   return (
     <div className="h-screen w-screen bg-[#06080D] text-[#F8FAFC] flex items-center justify-center overflow-hidden">
       <NeoVoiceVisualizer
         agentState={agentState}
         isLiveConnected={isLiveConnected}
-        onToggleLive={startDirectGeminiLiveSession}
+        onToggleLive={handleToggleLive}
         onInterruptSpeaking={handleInterruptSpeaking}
         onDevicesDiscovered={(newDevices) => {
           setDevices((prev) => {

@@ -340,11 +340,17 @@ export const NeoVoiceVisualizer: React.FC<NeoVoiceVisualizerProps> = ({
     return () => cancelAnimationFrame(animId);
   }, [agentState, isLiveConnected]);
 
-  const handleOrbOrMicClick = () => {
-    if (agentState === 'speaking' && onInterruptSpeaking) {
-      onInterruptSpeaking();
+  const handleOrbClick = () => {
+    if (!isLiveConnected) {
+      onToggleLive();
       return;
     }
+    if (agentState === 'speaking' && onInterruptSpeaking) {
+      onInterruptSpeaking();
+    }
+  };
+
+  const handleMicButtonClick = () => {
     onToggleLive();
   };
 
@@ -352,7 +358,7 @@ export const NeoVoiceVisualizer: React.FC<NeoVoiceVisualizerProps> = ({
     <div className="relative w-full h-full flex flex-col items-center justify-center select-none overflow-hidden">
       {/* 1. Harmonic Orb Animation */}
       <div
-        onClick={handleOrbOrMicClick}
+        onClick={handleOrbClick}
         className="relative w-[340px] h-[340px] sm:w-[440px] sm:h-[440px] flex items-center justify-center cursor-pointer"
       >
         <canvas ref={canvasRef} className="w-full h-full block" />
@@ -370,7 +376,7 @@ export const NeoVoiceVisualizer: React.FC<NeoVoiceVisualizerProps> = ({
       >
         <button
           type="button"
-          onClick={handleOrbOrMicClick}
+          onClick={handleMicButtonClick}
           className="flex items-center gap-3.5 cursor-pointer text-left"
         >
           <span className="relative flex items-center justify-center">
