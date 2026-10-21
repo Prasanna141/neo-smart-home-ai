@@ -1,8 +1,74 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, Loader2, Mic, MicOff, QrCode, X } from 'lucide-react';
+import QRCode from 'qrcode';
 import { soundEngine } from '../services/soundEngine';
 
 export type NeoAgentState = 'standby' | 'listening' | 'processing' | 'speaking';
+
+export const TUYA_SESSION_STORAGE_KEY = 'neo_tuya_free_session_v1';
+export const TUYA_WEBHOOK_STORAGE_KEY = 'neo_tuya_free_webhooks_v1';
+const TUYA_USERCODE_STORAGE_KEY = 'neo_tuya_usercode_v1';
+
+export async function neoJsonFetch(
+  apiUrl: string,
+  options: RequestInit = {}
+): Promise<any> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    ...((options.headers as Record<string, string>) || {}),
+  };
+
+  try {
+    const savedSession = localStorage.getItem(TUYA_SESSION_STORAGE_KEY);
+    if (savedSession && savedSession.startsWith('{')) {
+      headers['x-tuya-session'] = savedSession;
+    }
+  } catch {}
+
+  const tryFetchJson = async (targetUrl: string): Promise<any | null> => {
+    try {
+      const res = await fetch(targetUrl, {
+        ...options,
+        headers,
+      });
+      const text = await res.text();
+      if (!text || text.trim().startsWith('<')) {
+        return null;
+      }
+      const parsed = JSON.parse(text);
+      if (parsed?.tuyaSession?.accessToken) {
+        try {
+          localStorage.setItem(
+            TUYA_SESSION_STORAGE_KEY,
+            JSON.stringify(parsed.tuyaSession)
+          );
+        } catch {}
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+
+  // 1. Try standard /api/... URL first
+  const primaryResult = await tryFetchJson(apiUrl);
+  if (primaryResult !== null) {
+    return primaryResult;
+  }
+
+  // 2. Fallback to direct Vercel serverless entry /api/index?__path=...
+  const [pathname, queryString] = apiUrl.split('?');
+  const subPath = pathname.replace(/^\/api\//, '');
+  const fallbackUrl = `/api/index?__path=${encodeURIComponent(subPath)}${
+    queryString ? `&${queryString}` : ''
+  }`;
+  const fallbackResult = await tryFetchJson(fallbackUrl);
+  if (fallbackResult !== null) {
+    return fallbackResult;
+  }
+
+  throw new Error('API_UNREACHABLE');
+}
 
 interface NeoVoiceVisualizerProps {
   agentState: NeoAgentState;
@@ -26,12 +92,29 @@ export const NeoVoiceVisualizer: React.FC<NeoVoiceVisualizerProps> = ({
   // Free Smart Life QR Link Modal State (hidden by default so main screen shows ONLY Orb + Mic status)
   const [showFreeSetupModal, setShowFreeSetupModal] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<'qr' | 'trial'>('qr');
-  const [userCode, setUserCode] = useState<string>('');
+  const [userCode, setUserCode] = useState<string>(() => {
+    try {
+      return localStorage.getItem(TUYA_USERCODE_STORAGE_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [qrToken, setQrToken] = useState<string>('');
   const [qrLoading, setQrLoading] = useState<boolean>(false);
   const [qrError, setQrError] = useState<string>('');
-  const [qrConnectedUser, setQrConnectedUser] = useState<string>('');
+  const [qrConnectedUser, setQrConnectedUser] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem(TUYA_SESSION_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.accessToken) {
+          return parsed.username || 'Smart Life Connected';
+        }
+      }
+    } catch {}
+    return '';
+  });
 
   // Optional Free Webhook / New Trial Key inputs
   const [switchOnUrl, setSwitchOnUrl] = useState<string>('');
@@ -41,8 +124,7 @@ export const NeoVoiceVisualizer: React.FC<NeoVoiceVisualizerProps> = ({
   const [webhookSavedMsg, setWebhookSavedMsg] = useState<string>('');
 
   useEffect(() => {
-    fetch('/api/tuya/status')
-      .then((r) => r.json())
+    neoJsonFetch('/api/tuya/status')
       .then((st) => {
         if (st?.freeSharingConnected) {
           setQrConnectedUser(st.freeSharingUsername || 'Smart Life Connected');
@@ -55,16 +137,24 @@ export const NeoVoiceVisualizer: React.FC<NeoVoiceVisualizerProps> = ({
   useEffect(() => {
     if (!qrToken || !userCode || !showFreeSetupModal) return;
 
+    const cleanCode = userCode.trim().replace(/\s+/g, '');
     const timer = setInterval(async () => {
       try {
-        const res = await fetch(
+        const data = await neoJsonFetch(
           `/api/tuya/free-qr/poll?token=${encodeURIComponent(
             qrToken
-          )}&userCode=${encodeURIComponent(userCode)}`
+          )}&userCode=${encodeURIComponent(cleanCode)}`
         );
-        const data = await res.json();
         if (data?.authorized) {
           clearInterval(timer);
+          if (data.tuyaSession) {
+            try {
+              localStorage.setItem(
+                TUYA_SESSION_STORAGE_KEY,
+                JSON.stringify(data.tuyaSession)
+              );
+            } catch {}
+          }
           setQrConnectedUser(data.username || 'Smart Life App');
           setQrToken('');
           setQrDataUrl('');
@@ -83,31 +173,51 @@ export const NeoVoiceVisualizer: React.FC<NeoVoiceVisualizerProps> = ({
     setQrError('');
     setQrDataUrl('');
     setQrToken('');
-    if (!userCode.trim()) {
+
+    const cleanCode = userCode.trim().replace(/\s+/g, '');
+    if (!cleanCode) {
       setQrError(
         'Smart Life App -> Me -> Settings (⚙️) -> Account and Security -> User Code හි ඇති කේතය ඇතුළත් කරන්න.'
       );
       return;
     }
 
+    try {
+      localStorage.setItem(TUYA_USERCODE_STORAGE_KEY, cleanCode);
+    } catch {}
+
     setQrLoading(true);
     try {
-      const res = await fetch('/api/tuya/free-qr/start', {
+      const data = await neoJsonFetch('/api/tuya/free-qr/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userCode: userCode.trim() }),
+        body: JSON.stringify({ userCode: cleanCode }),
       });
-      const data = await res.json();
+
       if (!data?.success) {
         setQrError(
-          data?.message || 'QR කේතය ලබා ගැනීමට නොහැකි විය. User Code පරීක්ෂා කරන්න.'
+          data?.message ||
+            'QR කේතය ලබා ගැනීමට නොහැකි විය. User Code එක නිවැරදිදැයි පරීක්ෂා කරන්න.'
         );
       } else {
-        setQrDataUrl(data.qrDataUrl);
+        let finalQrUrl = data.qrDataUrl;
+        if (!finalQrUrl && data.token) {
+          finalQrUrl = await QRCode.toDataURL(
+            `tuyaSmart--qrLogin?token=${data.token}`,
+            {
+              width: 240,
+              margin: 2,
+              color: { dark: '#06080D', light: '#FFFFFF' },
+            }
+          );
+        }
+        setQrDataUrl(finalQrUrl);
         setQrToken(data.token);
       }
     } catch {
-      setQrError('සම්බන්ධතා දෝෂයකි. නැවත උත්සාහ කරන්න.');
+      setQrError(
+        'සර්වර් සම්බන්ධතා දෝෂයකි. ඔබ Vercel භාවිතා කරන්නේ නම් නවතම කේතය (api/index.ts සහ vercel.json) GitHub වෙත Push කර නැවත උත්සාහ කරන්න.'
+      );
     } finally {
       setQrLoading(false);
     }
@@ -117,26 +227,31 @@ export const NeoVoiceVisualizer: React.FC<NeoVoiceVisualizerProps> = ({
     e.preventDefault();
     setWebhookSavedMsg('');
     try {
-      const res = await fetch('/api/tuya/free-webhook', {
+      const payload = {
+        switchOnUrl: switchOnUrl.trim(),
+        switchOffUrl: switchOffUrl.trim(),
+        customAccessId: customAccessId.trim(),
+        customAccessSecret: customAccessSecret.trim(),
+      };
+      try {
+        localStorage.setItem(TUYA_WEBHOOK_STORAGE_KEY, JSON.stringify(payload));
+      } catch {}
+
+      const data = await neoJsonFetch('/api/tuya/free-webhook', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          switchOnUrl,
-          switchOffUrl,
-          customAccessId,
-          customAccessSecret,
-        }),
+        body: JSON.stringify(payload),
       });
-      const data = await res.json();
       if (data?.success) {
         setWebhookSavedMsg('සුරකින ලදී! (Saved successfully)');
-        const devRes = await fetch('/api/tuya/discover-devices');
-        const devData = await devRes.json();
+        const devData = await neoJsonFetch('/api/tuya/discover-devices');
         if (Array.isArray(devData?.devices) && onDevicesDiscovered) {
           onDevicesDiscovered(devData.devices);
         }
       }
-    } catch {}
+    } catch {
+      setWebhookSavedMsg('බ්‍රවුසරයේ සුරකින ලදී! (Saved locally)');
+    }
   };
 
   useEffect(() => {

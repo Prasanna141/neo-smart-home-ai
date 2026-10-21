@@ -263,16 +263,25 @@ class NeoSoundEngine {
       }
     };
 
-    try {
-      const audio = new Audio(
-        `/api/neo/tts-proxy?text=${encodeURIComponent(clean.slice(0, 500))}`
-      );
+    const playTtsUrl = async (url: string) => {
+      const audio = new Audio(url);
       this.activeAudioElement = audio;
       await new Promise<void>((resolve, reject) => {
         audio.onended = () => resolve();
         audio.onerror = (e) => reject(e);
         audio.play().catch(reject);
       });
+    };
+
+    try {
+      const encodedText = encodeURIComponent(clean.slice(0, 200));
+      try {
+        await playTtsUrl(`/api/neo/tts-proxy?text=${encodedText}`);
+      } catch {
+        await playTtsUrl(
+          `/api/index?__path=neo%2Ftts-proxy&text=${encodedText}`
+        );
+      }
       finishSpeaking();
       return;
     } catch {

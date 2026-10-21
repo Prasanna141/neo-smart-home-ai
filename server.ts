@@ -21,6 +21,19 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '25mb' }));
 
+app.use((req, _res, next) => {
+  if (req.path === '/api/index' && req.query?.__path) {
+    const sub = Array.isArray(req.query.__path)
+      ? req.query.__path.join('/')
+      : String(req.query.__path).replace(/^\/+/, '');
+    const q = new URLSearchParams(req.query as Record<string, string>);
+    q.delete('__path');
+    const qs = q.toString();
+    req.url = `/api/${sub}${qs ? `?${qs}` : ''}`;
+  }
+  next();
+});
+
 // ============================================================================
 // 1. PERSISTENT EVOLVING HUMAN-LIKE LONG-TERM MEMORY & DAILY SCHEDULE STORE
 // ============================================================================
@@ -1551,12 +1564,36 @@ async function discoverDevicesFromFreeSharing(): Promise<any[]> {
   });
 }
 
+function hydrateTuyaSessionFromRequest(req: any) {
+  try {
+    const bodySession = req.body?.tuyaSession;
+    if (bodySession && bodySession.accessToken && bodySession.refreshToken) {
+      neoBrain.tuyaFreeSharing = bodySession;
+      return;
+    }
+    const headerSession = req.headers?.['x-tuya-session'];
+    if (
+      typeof headerSession === 'string' &&
+      headerSession.trim().startsWith('{')
+    ) {
+      const parsed = JSON.parse(headerSession);
+      if (parsed && parsed.accessToken && parsed.refreshToken) {
+        neoBrain.tuyaFreeSharing = parsed;
+      }
+    }
+  } catch {}
+}
+
 // POST /api/tuya/free-qr/start -> Start 100% Free Smart Life QR Code Login using User Code
 app.post('/api/tuya/free-qr/start', async (req, res) => {
   try {
-    const userCode = String(req.body?.userCode || '').trim();
+    const rawUserCode = String(
+      req.body?.userCode || req.query?.userCode || ''
+    ).trim();
+    const userCode = rawUserCode.replace(/\s+/g, '');
+
     if (!userCode) {
-      return res.status(400).json({
+      return res.status(200).json({
         success: false,
         message:
           'කරුණාකර ඔබගේ Smart Life / Tuya Smart App හි User Code එක ඇතුළත් කරන්න (Me -> Settings ⚙️ -> Account and Security -> User Code).',
@@ -1567,8 +1604,20 @@ app.post('/api/tuya/free-qr/start', async (req, res) => {
       userCode
     )}&schema=${TUYA_FREE_SCHEMA}`;
 
-    const r = await fetch(url, { method: 'POST' });
-    const data: any = await r.json();
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+        'User-Agent': 'TuyaHomeAssistant/1.0',
+      },
+    });
+    const rawText = await r.text();
+    let data: any = {};
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      data = { success: false, msg: rawText };
+    }
     const token = data?.result?.qrcode;
 
     if (!data?.success || !token) {
@@ -1576,6 +1625,7 @@ app.post('/api/tuya/free-qr/start', async (req, res) => {
         success: false,
         code: data?.code || 'QR_ERROR',
         message:
+          data?.code === 'USERCODE_INCORRECT' ||
           data?.msg === 'User Code Incorrect'
             ? 'User Code එක නිවැරදි නොවේ. Smart Life App -> Me -> Settings (⚙️) -> Account and Security -> User Code හි ඇති කේතය නිවැරදිව ඇතුළත් කරන්න.'
             : data?.msg || 'QR කේතය ලබා ගැනීමට නොහැකි විය.',
@@ -1597,7 +1647,7 @@ app.post('/api/tuya/free-qr/start', async (req, res) => {
       qrDataUrl,
     });
   } catch (err: any) {
-    res.status(500).json({
+    res.status(200).json({
       success: false,
       message: err?.message || 'Failed to generate Smart Life QR code',
     });
@@ -1608,17 +1658,29 @@ app.post('/api/tuya/free-qr/start', async (req, res) => {
 app.get('/api/tuya/free-qr/poll', async (req, res) => {
   try {
     const token = String(req.query.token || '').trim();
-    const userCode = String(req.query.userCode || '').trim();
+    const userCode = String(req.query.userCode || '')
+      .trim()
+      .replace(/\s+/g, '');
     if (!token || !userCode) {
-      return res.status(400).json({ success: false, authorized: false });
+      return res.status(200).json({ success: false, authorized: false });
     }
 
     const url = `${TUYA_FREE_LOGIN_HOST}/v1.0/m/life/home-assistant/qrcode/tokens/${encodeURIComponent(
       token
     )}?clientid=${TUYA_FREE_CLIENT_ID}&usercode=${encodeURIComponent(userCode)}`;
 
-    const r = await fetch(url, { method: 'GET' });
-    const data: any = await r.json();
+    const r = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+        'User-Agent': 'TuyaHomeAssistant/1.0',
+      },
+    });
+    const rawText = await r.text();
+    let data: any = {};
+    try {
+      data = JSON.parse(rawText);
+    } catch {}
 
     if (data?.success && data?.result?.access_token) {
       const resObj = data.result;
@@ -1649,6 +1711,7 @@ app.get('/api/tuya/free-qr/poll', async (req, res) => {
         authorized: true,
         username: resObj.username || 'Smart Life User',
         devices: discovered,
+        tuyaSession: neoBrain.tuyaFreeSharing,
       });
     }
 
@@ -1704,7 +1767,8 @@ app.post('/api/tuya/free-webhook', async (req, res) => {
 });
 
 // GET /api/tuya/status
-app.get('/api/tuya/status', async (_req, res) => {
+app.get('/api/tuya/status', async (req, res) => {
+  hydrateTuyaSessionFromRequest(req);
   const accessId =
     neoBrain.freeWebhooks?.customAccessId || process.env.TUYA_ACCESS_ID || '';
   const accessSecret =
@@ -1739,8 +1803,9 @@ app.get('/api/tuya/status', async (_req, res) => {
 });
 
 // GET /api/tuya/discover-devices
-app.get('/api/tuya/discover-devices', async (_req, res) => {
+app.get('/api/tuya/discover-devices', async (req, res) => {
   try {
+    hydrateTuyaSessionFromRequest(req);
     // 1. Try 100% Free Forever Smart Life QR-Code Sharing API first!
     if (neoBrain.tuyaFreeSharing?.accessToken) {
       try {
@@ -1753,6 +1818,7 @@ app.get('/api/tuya/discover-devices', async (_req, res) => {
             mode: 'SMART_LIFE_FREE_QR_CONNECTED',
             devices: freeDevices,
             rawCount: freeDevices.length,
+            tuyaSession: neoBrain.tuyaFreeSharing,
           });
         }
       } catch (freeErr) {
@@ -1837,6 +1903,7 @@ app.get('/api/tuya/discover-devices', async (_req, res) => {
 // POST /api/tuya/cloud-sync
 app.post('/api/tuya/cloud-sync', async (req, res) => {
   try {
+    hydrateTuyaSessionFromRequest(req);
     const { deviceId, commands } = req.body;
     const cleanDeviceId = String(deviceId || '').replace(/^tuya-/, '');
     const accessId =
@@ -1890,6 +1957,7 @@ app.post('/api/tuya/cloud-sync', async (req, res) => {
             deviceId: cleanDeviceId,
             timestamp: Date.now().toString(),
             dispatchedCommands: primaryCommands,
+            tuyaSession: neoBrain.tuyaFreeSharing,
           });
         }
       } catch (freeCmdErr) {

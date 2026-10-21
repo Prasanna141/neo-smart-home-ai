@@ -15,6 +15,7 @@ import { soundEngine } from './services/soundEngine';
 import {
   NeoAgentState,
   NeoVoiceVisualizer,
+  neoJsonFetch,
 } from './components/NeoVoiceVisualizer';
 
 const REAL_DEVICES_STORAGE_KEY = 'neo_real_tuya_devices_v2';
@@ -75,8 +76,7 @@ export function App() {
 
   // Load persisted brain schedule & saved devices from server on startup
   useEffect(() => {
-    fetch('/api/neo/memory')
-      .then((r) => r.json())
+    neoJsonFetch('/api/neo/memory')
       .then((brain) => {
         if (Array.isArray(brain?.schedule) && brain.schedule.length > 0) {
           setSchedule(brain.schedule);
@@ -151,9 +151,8 @@ export function App() {
   // Sync Real Tuya Devices from Cloud automatically on load if configured
   const handleSyncFromTuyaCloud = useCallback(async () => {
     try {
-      const res = await fetch('/api/tuya/discover-devices');
-      const data = await res.json();
-      if (data.success && Array.isArray(data.devices) && data.devices.length > 0) {
+      const data = await neoJsonFetch('/api/tuya/discover-devices');
+      if (data?.success && Array.isArray(data.devices) && data.devices.length > 0) {
         setDevices((prev) => {
           const map = new Map<string, TuyaDevice>();
           for (const d of prev) map.set(d.id, d);
@@ -165,8 +164,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    fetch('/api/tuya/status')
-      .then((r) => r.json())
+    neoJsonFetch('/api/tuya/status')
       .then((st) => {
         if (st?.configured) {
           handleSyncFromTuyaCloud();
@@ -179,7 +177,7 @@ export function App() {
   const syncTuyaDeviceToCloud = useCallback(
     async (deviceId: string, commands: { code: string; value: any }[]) => {
       try {
-        await fetch('/api/tuya/cloud-sync', {
+        await neoJsonFetch('/api/tuya/cloud-sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ deviceId, commands }),
@@ -642,7 +640,7 @@ export function App() {
       setAgentState('processing');
 
       try {
-        const res = await fetch('/api/neo/voice-turn', {
+        const data = await neoJsonFetch('/api/neo/voice-turn', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -654,7 +652,6 @@ export function App() {
             language: 'si',
           }),
         });
-        const data = await res.json();
 
         if (!isLiveConnectedRef.current) return;
 
